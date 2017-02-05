@@ -1,8 +1,8 @@
+#include "rfcommon.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <inttypes.h>
-//#include <sys/mman.h>
 #include <assert.h>
 #include <unistd.h>
 #include <errno.h>
@@ -10,7 +10,8 @@
 #include <string.h>
 #include <wiringPi.h>
 
-#define RECORD_SIGNAL_BUFFER        (500)       /* size of recording buffer */
+#define RECORD_PIN                  (2)         /* pin number used by default */
+#define RECORD_SIGNAL_BUFFER        (250)       /* default size of recording buffer */
 #define RECORD_SIGNAL_ROUND         (5)         /* round duration (in usec) to multiples of this value */
 #define RECORD_TIMEOUT_MIN_ENTRIES  (10)        /* minimum entries in buffer before recording timeout */
 #define RECORD_TIMEOUT_TIME         (1000000)   /* recording timeout (in usec) 1 sec */
@@ -25,12 +26,15 @@
 uint32_t
     *buffer,
     *buffer_end,
-    *buffer_top;
+    *buffer_top,
+    config_pin = RECORD_PIN,
+    config_buffer_size = RECORD_SIGNAL_BUFFER,
+    config_record_samples = RECORD_SAMPLES_COUNT,
+    config_record_failures = RECORD_SAMPLES_FAILS;
 
-long time_elapsed(struct timespec before, struct timespec after) {
-    return (after.tv_sec - before.tv_sec) * 1000000000L +
-           (after.tv_nsec - before.tv_nsec);
-}
+char
+    *config_filename = 0,
+    default_filename[128];
 
 uint8_t pattern_near_match(uint32_t a, uint32_t b) {
     return ABS((int32_t) a - (int32_t) b) < PATTERN_MATCH_TOLERANCE;
@@ -43,12 +47,12 @@ uint8_t pattern_near_match_pair(uint32_t *a, uint32_t *b) {
 uint8_t pattern_near_match_blob(uint32_t *a, uint32_t a_len, uint32_t *b, uint32_t b_len) {
     uint32_t i;
 
-    if(a_len != b_len) {
+    if (a_len != b_len) {
         return 0;
     }
 
     for (i = 0; i < a_len; i++) {
-        if(!pattern_near_match(a[i], b[i])) {
+        if (!pattern_near_match(a[i], b[i])) {
             return 0;
         }
     }
@@ -74,7 +78,7 @@ uint8_t pattern_match_buffer(uint32_t **pattern) {
     uint8_t ok;
 
     /* alloc starts buffer */
-    starts_buffer = (uint32_t **) malloc(sizeof(uint32_t *) * RECORD_SIGNAL_BUFFER);
+    starts_buffer = (uint32_t **) malloc(sizeof(uint32_t * ) * 2 * config_buffer_size);
 
     /*
      * Start searching for start point. Assuming there is a significantly long low signal before same blob repeats
@@ -125,20 +129,20 @@ uint8_t pattern_match_buffer(uint32_t **pattern) {
             }
 
             blob_appearances = 1;
-            for(starts_check = starts_current + 1; starts_check < starts_top - 1; starts_check++) {
-                if(blob_len == starts_check[1] - starts_check[0]) {
+            for (starts_check = starts_current + 1; starts_check < starts_top - 1; starts_check++) {
+                if (blob_len == starts_check[1] - starts_check[0]) {
                     blob_appearances++;
                 }
             }
 
-            if(blob_appearances > blob_best_appearances) {
+            if (blob_appearances > blob_best_appearances) {
                 blob_best_appearances = blob_appearances;
                 blob_best_len = blob_len;
             }
         }
 
         /* Blobs should appear at least a few times. */
-        if(blob_best_appearances < PATTERN_MIN_APPEARANCES) {
+        if (blob_best_appearances < PATTERN_MIN_APPEARANCES) {
             free(starts_buffer);
             return 0;
         }
@@ -147,38 +151,38 @@ uint8_t pattern_match_buffer(uint32_t **pattern) {
         blob_best_start = 0;
         blob_best_appearances = 0;
         for (starts_current = starts_buffer; starts_current < starts_top - 1; starts_current++) {
-            if(starts_current[1] - starts_current[0] != blob_best_len) {
+            if (starts_current[1] - starts_current[0] != blob_best_len) {
                 continue;
             }
 
-            if(!blob_best_start) {
+            if (!blob_best_start) {
                 blob_best_start = starts_current;
                 continue;
             }
 
             /* Count appearances of blob in buffer*/
             blob_appearances = 0;
-            for(starts_check = starts_buffer; starts_check < starts_top - 1; starts_check++) {
+            for (starts_check = starts_buffer; starts_check < starts_top - 1; starts_check++) {
                 if (pattern_near_match_blob(*starts_current, blob_best_len,
                                             *starts_check, starts_check[1] - starts_check[0])) {
                     blob_appearances++;
                 }
             }
 
-            if(blob_appearances > blob_best_appearances) {
+            if (blob_appearances > blob_best_appearances) {
                 blob_best_appearances = blob_appearances;
                 blob_best_start = starts_current;
             }
         }
 
         /* If no blob was found, clean up and return. */
-        if(!blob_best_start) {
+        if (!blob_best_start) {
             free(starts_buffer);
             return 0;
         }
 
         /* Copy the pattern */
-        if(pattern) {
+        if (pattern) {
             *pattern = (uint32_t *) malloc(sizeof(uint32_t) * blob_best_len);
 
             for (i = 0; i < blob_best_len; i++) {
@@ -198,40 +202,106 @@ uint8_t pattern_match_buffer(uint32_t **pattern) {
     return 0;
 }
 
-void printUsage() {
+void print_usage() {
+    printf("Usage: rfrecorder [options]\n");
+    printf("Options:\n");
+    printf("  --help                        Print this help message\n");
+    printf("  -o <path>, --output <path>    Specifies the output file path\n");
+    printf("  -p <number>, --pin <number>   The input (wiringPi) pin number (see http://pinout.xyz\n");
+    printf("                                for details, default: %d)\n", RECORD_PIN);
+    printf("  --buffer-size <size>          The size of the input buffer (default: %d)\n", RECORD_SIGNAL_BUFFER);
+    printf("  --record-samples <samples>    The number of samples recorded (default: %d)\n", RECORD_SAMPLES_COUNT);
+    printf("  --record-failures <count>     The number of samples not matching previous samples\n");
+    printf("                                before discarding all previous samples (default: %d)\n", RECORD_SAMPLES_FAILS);
 
+    exit(1);
+}
+
+void parse_args(int argc, char **argv) {
+    uint32_t i;
+
+    for (i = 0; i < argc; i++) {
+        if(!strcmp(argv[i], "--help")) {
+            print_usage();
+        }
+        else if(!strcmp(argv[i], "--output") || !strcmp(argv[i], "-o")) {
+            config_filename = parse_args_string(i, argc, argv);
+        }
+        else if(!strcmp(argv[i], "--pin") || !strcmp(argv[i], "-p")) {
+            config_pin = parse_args_uint32(i, argc, argv);
+
+            if(config_pin >= 64){
+                print_usage();
+            }
+        }
+        else if(!strcmp(argv[i], "--buffer-size")) {
+            config_buffer_size = parse_args_uint32(i, argc, argv);
+
+            if(config_buffer_size < 2){
+                print_usage();
+            }
+        }
+        else if(!strcmp(argv[i], "--record-samples")) {
+            config_record_samples = parse_args_uint32(i, argc, argv);
+
+            if(config_record_samples < 1 || config_record_samples >= 256){
+                print_usage();
+            }
+        }
+        else if(!strcmp(argv[i], "--record-failures")) {
+            config_record_failures = parse_args_uint32(i, argc, argv);
+
+            if(config_record_failures < 1){
+                print_usage();
+            }
+        }
+    }
+
+    if(!config_filename) {
+        time_t nowt = time(NULL);
+        struct tm *t = localtime(&nowt);
+        strftime(default_filename, sizeof(default_filename), "%Y%m%d%H%M%S", t);
+        sprintf(default_filename, "%s.rfdat", default_filename);
+        config_filename = default_filename;
+    }
 }
 
 int main(int argc, char **argv) {
-    printf("Setting up GPIO...\n");
+    struct timespec last_change, now;
+    long elapsed;
+    int last = 0,
+        waiting = 0;
+    uint32_t
+        i, j,
+        match,
+        *samples[256],
+        sample_idx = 0,
+        sample_length = 0,
+        sample_fails = 0,
+        *sample,
+        sample_best_idx = 0,
+        sample_best_score = 0,
+        sample_score;
+
+
+    parse_args(argc, argv);
+
     if (wiringPiSetup() < 0) {
         printf("Unable to setup wiringPi: %s\n", strerror(errno));
         return 1;
     }
 
-    pinMode(2, INPUT);
-
-    printf("Started...\n");
-    struct timespec last_change, now;
-    long elapsed;
-    int last = 0, waiting = 0;
-    uint32_t *samples[RECORD_SAMPLES_COUNT];
-    uint32_t sample_idx = 0;
-    uint32_t sample_length = 0;
-    uint32_t sample_fails = 0;
-    uint32_t i;
-
-    assert(RECORD_SIGNAL_BUFFER % 2 == 0);
+    pinMode(config_pin, INPUT);
 
     /* alloc pattern search buffer */
-    buffer = (uint32_t *) malloc(sizeof(uint32_t) * RECORD_SIGNAL_BUFFER);
-    buffer_end = buffer + RECORD_SIGNAL_BUFFER;
+    buffer = (uint32_t *) malloc(sizeof(uint32_t) * 2 * config_buffer_size);
+    buffer_end = buffer + 2 * config_buffer_size;
     buffer_top = buffer;
 
-    printf("Record start...\n");
-    while (sample_idx != RECORD_SAMPLES_COUNT) {
+    printf("Recording...\n");
+    while (sample_idx < config_record_samples) {
         /* read */
-        int on = digitalRead(2);
+        int on = digitalRead(config_pin);
 
         /* time */
         clock_gettime(CLOCK_REALTIME, &now);
@@ -258,26 +328,23 @@ int main(int argc, char **argv) {
             buffer_top++;
 
             if (buffer_top == buffer_end) {
-                uint32_t *pattern;
-                uint32_t match = pattern_match_buffer(&pattern);
+                match = pattern_match_buffer(&sample);
                 if (match) {
-                    if(sample_idx == 0) {
-                        samples[sample_idx++] = pattern;
+                    if (sample_idx == 0) {
+                        samples[sample_idx++] = sample;
                         sample_length = match;
 
-                        printf("Received sample (%d) %d/%d...\n", match, sample_idx, RECORD_SAMPLES_COUNT);
-                    }
-                    else if(sample_length != match) {
+                        printf("Received sample (%d) %d/%d...\n", match, sample_idx, config_record_samples);
+                    } else if (sample_length != match) {
                         sample_fails++;
-                        printf("Received invalid sample (%d) %d/%d...\n", match, sample_idx, RECORD_SAMPLES_COUNT);
-                    }
-                    else {
-                        samples[sample_idx++] = pattern;
-                        printf("Received sample (%d) %d/%d...\n", match, sample_idx, RECORD_SAMPLES_COUNT);
+                        printf("Received invalid sample (%d) %d/%d...\n", match, sample_idx, config_record_samples);
+                    } else {
+                        samples[sample_idx++] = sample;
+                        printf("Received sample (%d) %d/%d...\n", match, sample_idx, config_record_samples);
                     }
 
-                    if(sample_fails > RECORD_SAMPLES_FAILS) {
-                        for(i = 0; i < sample_idx; i++) {
+                    if (sample_fails > config_record_failures) {
+                        for (i = 0; i < sample_idx; i++) {
                             free(samples[i]);
                         }
                         sample_fails = 0;
@@ -299,30 +366,39 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("Done! Pattern:\n");
-    // TODO: Match all samples and use the best. Probably can use a part of matching script above.
-    for (i = 0; i < sample_length; i+= 2) {
-        printf(">>> ON for %d usec, OFF for %d usec\n", samples[0][i], samples[0][i + 1]);
+    for (i = 0; i < config_record_samples; i++) {
+        sample_score = 0;
+        for (j = 0; j < config_record_samples; j++) {
+            if(pattern_near_match_blob(samples[i], sample_length, samples[j], sample_length)) {
+                sample_score++;
+            }
+        }
+
+        if(sample_score > sample_best_score) {
+            sample_best_idx = i;
+            sample_best_score = sample_score;
+        }
     }
 
-    char fname[128];
+    printf("Done! Sample:\n");
+    for (i = 0; i < sample_length; i += 2) {
+        printf(">>> ON for %d usec, OFF for %d usec\n", samples[sample_best_idx][i], samples[sample_best_idx][i + 1]);
+    }
 
-    time_t nowt = time(NULL);
-    struct tm *t = localtime(&nowt);
-    strftime(fname, sizeof(fname), "%Y%m%d%H%M%S", t);
-    sprintf(fname, "%s.rfdat", fname);
+    printf("\n");
+    printf("Sample has a score of %.2f%%.", (float)sample_best_score / config_record_samples * 100);
 
-    FILE *pFile = fopen(fname,"wb");
+    FILE *pFile = fopen(config_filename, "wb");
 
-    if (pFile){
+    if (pFile) {
         fwrite(samples[0], sizeof(uint32_t), sample_length, pFile);
     }
 
     fclose(pFile);
 
-    printf("Saved to %s!\n", fname);
+    printf("Saved to %s!\n", config_filename);
 
-    for(i = 0; i < sample_idx; i++) {
+    for (i = 0; i < sample_idx; i++) {
         free(samples[i]);
     }
     free(buffer);
